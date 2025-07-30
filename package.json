@@ -1,5 +1,5 @@
 {
-  "name": "tap-tycoon-server",
+  "name": "Tap_Tycoon_Bot",
   "version": "1.0.0",
   "description": "Referral server for Tap Tycoon game",
   "main": "server.js",
