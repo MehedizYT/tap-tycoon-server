@@ -1,111 +1,144 @@
-// This is the full server code for index.js
-
+// --- DEPENDENCIES ---
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg'); // Changed from sqlite3 to pg's Pool
 const cors = require('cors');
 
-const BOT_TOKEN = process.env.BOT_TOKEN; // Loaded from Render's Environment Variables
+// --- CONFIGURATION ---
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL; // From Render Environment Variables
 const PORT = process.env.PORT || 3000;
-const DB_FILE = './data/game_data.db'; // Store DB in a dedicated data directory
 const REFERRER_REWARD = { money: 50000, gems: 5 };
 
+// --- VALIDATION ---
 if (!BOT_TOKEN) {
-    console.error("FATAL ERROR: BOT_TOKEN is not defined. Please set it in your environment variables.");
+    console.error("FATAL ERROR: BOT_TOKEN is not defined.");
+    process.exit(1);
+}
+if (!DATABASE_URL) {
+    console.error("FATAL ERROR: DATABASE_URL is not defined. Please set it in your Render environment variables.");
     process.exit(1);
 }
 
-// Ensure the data directory exists
-const fs = require('fs');
-const path = require('path');
-const dbDir = path.dirname(DB_FILE);
-if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir);
-}
-
-const db = new sqlite3.Database(DB_FILE, (err) => {
-    if (err) {
-        console.error('DATABASE ERROR:', err.message);
-        process.exit(1);
-    } else {
-        console.log('✅ Connected to the SQLite database.');
-        db.serialize(() => {
-            // Table for referral tracking
-            db.run(`CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id TEXT NOT NULL,
-                referred_id TEXT NOT NULL UNIQUE,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-
-            // Table for saving the entire game state for each user
-            db.run(`CREATE TABLE IF NOT EXISTS user_saves (
-                user_id TEXT PRIMARY KEY NOT NULL,
-                game_state TEXT NOT NULL,
-                last_saved TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )`);
-            console.log('✅ Database tables initialized.');
-        });
+// --- DATABASE INITIALIZATION ---
+// Create a new Pool instance to connect to the PostgreSQL database
+const pool = new Pool({
+    connectionString: DATABASE_URL,
+    // Required for Render's PostgreSQL connections
+    ssl: {
+        rejectUnauthorized: false
     }
 });
 
+// Function to create the table if it doesn't exist
+const initializeDatabase = async () => {
+    const createTableQuery = `
+        CREATE TABLE IF NOT EXISTS referrals (
+            id SERIAL PRIMARY KEY,
+            referrer_id BIGINT NOT NULL,
+            referred_id BIGINT NOT NULL UNIQUE,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+    `;
+    try {
+        await pool.query(createTableQuery);
+        console.log('✅ Database initialized and referrals table is ready.');
+    } catch (err) {
+        console.error('🚨 DATABASE INITIALIZATION ERROR:', err.stack);
+        process.exit(1); // Exit if we can't even create the table
+    }
+};
+
+// --- TELEGRAM BOT LOGIC ---
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 bot.on('polling_error', (error) => console.error(`🚨 POLLING ERROR: ${error.code} - ${error.message}`));
 console.log('🤖 Telegram Bot is polling for messages...');
 
-bot.onText(/\/start (.+)/, (msg, match) => {
-    const referredId = String(msg.from.id);
-    const referrerId = String(match[1]);
+bot.onText(/\/start (.+)/, async (msg, match) => {
+    const referredId = msg.from.id;
+    const referrerId = match[1];
 
-    // A user cannot refer themselves
-    if (referredId === referrerId) return;
+    // Prevent users from referring themselves
+    if (String(referredId) === String(referrerId)) return;
 
     console.log(`➡️ Referral attempt: ${referrerId} -> ${referredId}`);
-    const sql = `INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)`;
-    db.run(sql, [referrerId, referredId], function(err) {
-        if (err) {
-            console.error("🚨 DATABASE INSERT ERROR:", err.message);
-        } else if (this.changes > 0) {
-            console.log(`✅ New referral recorded for ${referredId} by ${referrerId}.`);
-            // You can optionally notify the referred user
-            // bot.sendMessage(referredId, "Welcome! Thanks to a friend, you'll get a special bonus in the game!");
+    
+    // Use PostgreSQL's parameterized query syntax ($1, $2, etc.)
+    const sql = `INSERT INTO referrals (referrer_id, referred_id) VALUES ($1, $2) ON CONFLICT (referred_id) DO NOTHING`;
+    
+    try {
+        const result = await pool.query(sql, [referrerId, referredId]);
+        // If a row was inserted, rowCount will be 1
+        if (result.rowCount > 0) {
+            console.log(`✅ New referral recorded: ${referrerId} -> ${referredId}`);
+            bot.sendMessage(referredId, "Welcome! Thanks for being referred by a friend, you'll get a special starting bonus in the game!");
         } else {
-            console.log(`❕ Referral already exists for ${referredId}.`);
+            console.log(`-  Existing user started with referral link: ${referredId}`);
         }
-    });
+    } catch (err) {
+        console.error("🚨 DATABASE INSERT ERROR:", err.message);
+    }
 });
 
+// Default start command without a referral code
+bot.onText(/\/start$/, (msg) => {
+    bot.sendMessage(msg.chat.id, "Welcome to Tap Tycoon! Open the game below to start playing.");
+});
+
+
+// --- API SERVER (EXPRESS) ---
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '500kb' })); // Use express.json and set a size limit
+app.use(express.json());
 
 app.get('/', (req, res) => res.send('Tap Tycoon API Server is online.'));
 
-// --- START: NEW SAVE/LOAD LOGIC ---
+// Refactored to use async/await for cleaner code
+app.get('/my-referrals/:userId', async (req, res) => {
+    const { userId } = req.params;
+    console.log(`➡️ Request for stats for user: ${userId}`);
+    const sql = `SELECT status FROM referrals WHERE referrer_id = $1`;
+    try {
+        const { rows } = await pool.query(sql, [userId]);
+        const unclaimedCount = rows.filter(r => r.status === 'pending').length;
+        res.json({
+            friendsInvited: rows.length,
+            unclaimedCount: unclaimedCount,
+            unclaimedReward: { money: unclaimedCount * REFERRER_REWARD.money, gems: unclaimedCount * REFERRER_REWARD.gems }
+        });
+    } catch (err) {
+        console.error(`🚨 DB QUERY ERROR for user ${userId}:`, err.message);
+        res.status(500).json({ error: 'Database query failed' });
+    }
+});
 
-// Endpoint to LOAD a user's saved game
-app.get('/load/:userId', (req, res) => {
-    const userId = req.params.userId;
-    if (!userId) return res.status(400).json({ error: 'User ID is required.' });
+// Refactored to use async/await
+app.post('/claim-rewards', async (req, res) => {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-    console.log(`➡️ [LOAD] Request for save data for user: ${userId}`);
-    const sql = `SELECT game_state FROM user_saves WHERE user_id = ?`;
+    console.log(`➡️ Request to claim rewards for user: ${userId}`);
+    const sql = `UPDATE referrals SET status = 'claimed' WHERE referrer_id = $1 AND status = 'pending'`;
+    try {
+        const result = await pool.query(sql, [userId]);
+        // result.rowCount contains the number of updated rows
+        res.status(200).json({
+            claimedCount: result.rowCount,
+            rewards: { money: result.rowCount * REFERRER_REWARD.money, gems: result.rowCount * REFERRER_REWARD.gems }
+        });
+    } catch (err) {
+        console.error(`🚨 DB UPDATE ERROR for user ${userId}:`, err.message);
+        res.status(500).json({ error: 'Database update failed' });
+    }
+});
 
-    db.get(sql, [userId], (err, row) => {
-        if (err) {
-            console.error(`🚨 [LOAD] DB QUERY ERROR for user ${userId}:`, err.message);
-            return res.status(500).json({ error: 'Database query failed' });
-        }
-        if (row && row.game_state) {
-            console.log(`✅ [LOAD] Found save data for user: ${userId}`);
-            res.status(200).json(JSON.parse(row.game_state));
-        } else {
-            console.log(`❕ [LOAD] No save data found for new user: ${userId}`);
-            // 404 is the correct status code for "Not Found"
-            res.status(404).json({ message: 'No save data found for this user.' });
-        }
-    });
+// --- SERVER START ---
+// Start the server only after the database is confirmed to be ready
+app.listen(PORT, async () => {
+    await initializeDatabase();
+    console.log(`🚀 API Server is listening on port ${PORT}`);
+});    });
 });
 
 // Endpoint to SAVE a user's game state
