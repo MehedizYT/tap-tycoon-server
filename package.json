@@ -1,6 +1,6 @@
 {
   "name": "tap-tycoon-server",
-  "version": "1.0.0",
+  "version": "1.6.1",
   "description": "Server for Telegram game",
   "main": "index.js",
   "scripts": {
