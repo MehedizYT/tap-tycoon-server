@@ -7,7 +7,7 @@ const cors = require('cors');
 
 const BOT_TOKEN = process.env.BOT_TOKEN; // Loaded from Render's Environment Variables
 const PORT = process.env.PORT || 3000;
-const DB_FILE = './referrals.db';
+const DB_FILE = './referrals.db'; // Note: Both tables will be in this single DB file.
 const REFERRER_REWARD = { money: 50000, gems: 5 };
 
 if (!BOT_TOKEN) {
@@ -19,12 +19,20 @@ const db = new sqlite3.Database(DB_FILE, (err) => {
     if (err) { console.error('DATABASE ERROR:', err.message); }
     else {
         console.log('✅ Connected to the SQLite database.');
+        // Create referrals table if it doesn't exist
         db.run(`CREATE TABLE IF NOT EXISTS referrals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             referrer_id INTEGER NOT NULL,
             referred_id INTEGER NOT NULL UNIQUE,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // --- NEW: Create user_data table for saving game state ---
+        db.run(`CREATE TABLE IF NOT EXISTS user_data (
+            user_id INTEGER PRIMARY KEY,
+            game_state TEXT NOT NULL,
+            last_saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )`);
     }
 });
@@ -51,9 +59,51 @@ bot.onText(/\/start (.+)/, (msg, match) => {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // Increased limit to handle potentially large game states
 
 app.get('/', (req, res) => res.send('Tap Tycoon API Server is online.'));
+
+// --- NEW: Endpoint to save game data ---
+app.post('/save', (req, res) => {
+    const { userId, gameState } = req.body;
+    if (!userId || !gameState) {
+        return res.status(400).json({ error: 'userId and gameState are required' });
+    }
+
+    const sql = `INSERT OR REPLACE INTO user_data (user_id, game_state, last_saved_at) VALUES (?, ?, CURRENT_TIMESTAMP)`;
+    // We stringify the gameState object to store it as a JSON text blob in the database
+    db.run(sql, [userId, JSON.stringify(gameState)], function(err) {
+        if (err) {
+            console.error(`🚨 DB SAVE ERROR for user ${userId}:`, err.message);
+            return res.status(500).json({ error: 'Database save failed' });
+        }
+        res.status(200).json({ success: true, message: 'Game saved successfully.' });
+    });
+});
+
+
+// --- NEW: Endpoint to load game data ---
+app.get('/load/:userId', (req, res) => {
+    const userId = req.params.userId;
+    if (!userId) {
+        return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const sql = `SELECT game_state FROM user_data WHERE user_id = ?`;
+    db.get(sql, [userId], (err, row) => {
+        if (err) {
+            console.error(`🚨 DB LOAD ERROR for user ${userId}:`, err.message);
+            return res.status(500).json({ error: 'Database load failed' });
+        }
+        if (row) {
+            // If data is found, parse the JSON string before sending it back
+            res.status(200).json(JSON.parse(row.game_state));
+        } else {
+            // If no data is found for the user, it's a new player
+            res.status(404).json({ message: 'No save data found for this user.' });
+        }
+    });
+});
 
 app.get('/my-referrals/:userId', (req, res) => {
     const userId = req.params.userId;
